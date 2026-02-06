@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"flag"
+	"fmt"
 	"io"
 	"log"
 	"math"
@@ -10,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -17,16 +20,149 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/stefano/minitunnel/internal/protocol"
+	"gopkg.in/yaml.v3"
 )
 
-func main() {
-	serverURL := os.Getenv("SERVER_URL")
-	authToken := os.Getenv("AUTH_TOKEN")
-	serviceName := os.Getenv("SERVICE_NAME")
-	localTarget := os.Getenv("LOCAL_TARGET")
+// Config holds the configuration from ~/.minitunnel.yaml
+type Config struct {
+	Server string `yaml:"server"`
+	Token  string `yaml:"token"`
+}
 
-	if serverURL == "" || authToken == "" || serviceName == "" || localTarget == "" {
-		log.Fatal("SERVER_URL, AUTH_TOKEN, SERVICE_NAME, and LOCAL_TARGET are required")
+func loadConfig() (*Config, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, err
+	}
+
+	configPath := filepath.Join(home, ".minitunnel.yaml")
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return &Config{}, nil // No config file, return empty config
+		}
+		return nil, err
+	}
+
+	var cfg Config
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return nil, fmt.Errorf("failed to parse config: %w", err)
+	}
+
+	return &cfg, nil
+}
+
+func usage() {
+	fmt.Fprintf(os.Stderr, `minitunnel - expose local services through a tunnel server
+
+Usage:
+  minitunnel [protocol] <port> [flags]
+  minitunnel http 8000 --name myservice
+  minitunnel 8000 --name myservice
+
+Flags:
+`)
+	flag.PrintDefaults()
+	fmt.Fprintf(os.Stderr, `
+Environment Variables (fallback):
+  SERVER_URL    - Tunnel server URL
+  AUTH_TOKEN    - Authentication token
+  SERVICE_NAME  - Service name for routing
+  LOCAL_TARGET  - Local target (e.g., localhost:8000)
+
+Config File (~/.minitunnel.yaml):
+  server: http://example.com:8888
+  token: your-token
+
+Priority: CLI flags > Environment variables > Config file
+`)
+}
+
+func main() {
+	// Define flags
+	var (
+		name   = flag.String("name", "", "Service name for routing (required)")
+		server = flag.String("server", "", "Tunnel server URL")
+		token  = flag.String("token", "", "Authentication token")
+		host   = flag.String("host", "localhost", "Local host to forward to")
+	)
+
+	flag.Usage = usage
+
+	// Extract positional args (before parsing flags) to allow flags anywhere
+	// e.g., "http 8000 --name mmg" or "--name mmg http 8000"
+	positional, flagArgs := separateArgs(os.Args[1:])
+
+	// Parse only the flag arguments
+	if err := flag.CommandLine.Parse(flagArgs); err != nil {
+		os.Exit(1)
+	}
+
+	// Load config file
+	cfg, err := loadConfig()
+	if err != nil {
+		log.Printf("Warning: failed to load config: %v", err)
+		cfg = &Config{}
+	}
+
+	// Parse positional arguments: [protocol] <port>
+	var protocol, port string
+
+	switch len(positional) {
+	case 0:
+		// No positional args - check for LOCAL_TARGET env var (legacy mode)
+		if os.Getenv("LOCAL_TARGET") == "" {
+			fmt.Fprintln(os.Stderr, "Error: port is required")
+			usage()
+			os.Exit(1)
+		}
+	case 1:
+		// Just port: "8000"
+		protocol = "http"
+		port = positional[0]
+	case 2:
+		// Protocol and port: "http 8000"
+		protocol = positional[0]
+		port = positional[1]
+	default:
+		fmt.Fprintln(os.Stderr, "Error: too many arguments")
+		usage()
+		os.Exit(1)
+	}
+
+	// Build local target from positional args or env var
+	var localTarget string
+	if port != "" {
+		localTarget = fmt.Sprintf("%s://%s:%s", protocol, *host, port)
+	}
+
+	// Resolve configuration with priority: CLI flags > env vars > config file
+	serverURL := resolve(*server, os.Getenv("SERVER_URL"), cfg.Server)
+	authToken := resolve(*token, os.Getenv("AUTH_TOKEN"), cfg.Token)
+	serviceName := resolve(*name, os.Getenv("SERVICE_NAME"), "")
+	if localTarget == "" {
+		localTarget = os.Getenv("LOCAL_TARGET")
+	}
+
+	// Validate required fields
+	var missing []string
+	if serverURL == "" {
+		missing = append(missing, "server")
+	}
+	if authToken == "" {
+		missing = append(missing, "token")
+	}
+	if serviceName == "" {
+		missing = append(missing, "name")
+	}
+	if localTarget == "" {
+		missing = append(missing, "port/target")
+	}
+
+	if len(missing) > 0 {
+		fmt.Fprintf(os.Stderr, "Error: missing required configuration: %s\n", strings.Join(missing, ", "))
+		usage()
+		os.Exit(1)
 	}
 
 	// Ensure localTarget has scheme
@@ -45,6 +181,58 @@ func main() {
 
 	<-done
 	log.Println("client shut down")
+}
+
+// separateArgs separates positional arguments from flag arguments
+// This allows flags to appear anywhere (e.g., "http 8000 --name mmg")
+func separateArgs(args []string) (positional, flags []string) {
+	knownFlags := map[string]bool{
+		"-name": true, "--name": true,
+		"-server": true, "--server": true,
+		"-token": true, "--token": true,
+		"-host": true, "--host": true,
+		"-h": true, "--help": true, "-help": true,
+	}
+
+	i := 0
+	for i < len(args) {
+		arg := args[i]
+		if strings.HasPrefix(arg, "-") {
+			// It's a flag
+			flags = append(flags, arg)
+			// Check if this flag takes a value (not a boolean)
+			if arg == "-h" || arg == "--help" || arg == "-help" {
+				i++
+				continue
+			}
+			// Check if value is in same arg (e.g., --name=value)
+			if strings.Contains(arg, "=") {
+				i++
+				continue
+			}
+			// Check if it's a known flag that takes a value
+			base := strings.TrimPrefix(strings.TrimPrefix(arg, "-"), "-")
+			if knownFlags["-"+base] && i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
+				i++
+				flags = append(flags, args[i])
+			}
+		} else {
+			// It's a positional argument
+			positional = append(positional, arg)
+		}
+		i++
+	}
+	return
+}
+
+// resolve returns the first non-empty value (priority order)
+func resolve(values ...string) string {
+	for _, v := range values {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 func runClient(serverURL, authToken, serviceName, localTarget string, stop chan os.Signal) {
