@@ -146,18 +146,17 @@ func main() {
 	})
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		// Parse /<service>/rest/of/path
-		path := strings.TrimPrefix(r.URL.Path, "/")
-		parts := strings.SplitN(path, "/", 2)
-		if len(parts) == 0 || parts[0] == "" {
-			http.Error(w, "no service specified in path", http.StatusBadRequest)
+		// Extract service from subdomain: mmg.test.example.com → mmg
+		host := r.Host
+		if colonIdx := strings.Index(host, ":"); colonIdx != -1 {
+			host = host[:colonIdx]
+		}
+		parts := strings.Split(host, ".")
+		if len(parts) < 2 {
+			http.Error(w, "invalid host format", http.StatusBadRequest)
 			return
 		}
-		service := parts[0]
-		remainder := "/"
-		if len(parts) == 2 {
-			remainder = "/" + parts[1]
-		}
+		service := parts[0] // First subdomain is the service name
 
 		t := reg.get(service)
 		if t == nil {
@@ -176,8 +175,8 @@ func main() {
 			headers[k] = strings.Join(v, ", ")
 		}
 
-		// Preserve query string
-		forwardPath := remainder
+		// Preserve full path and query string
+		forwardPath := r.URL.Path
 		if r.URL.RawQuery != "" {
 			forwardPath += "?" + r.URL.RawQuery
 		}
